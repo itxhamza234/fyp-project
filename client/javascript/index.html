@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Voice Assistant</title>
+  <link rel="stylesheet" href="/src/style.css">
+</head>
+
+<body class="dark-theme">
+  <div class="app-container">
+    <!-- Header with Controls -->
+    <header class="app-header">
+      <div class="header-content">
+        <div class="connection-status">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="connection-status">Disconnected</span>
+        </div>
+        <div class="controls">
+          <input type="text" id="chatbot-id-input" placeholder="Enter Chatbot ID" />
+          <button id="connect-btn" class="btn btn-primary">Connect</button>
+          <button id="disconnect-btn" class="btn btn-danger" disabled>Disconnect</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <!-- Voice Mode Section -->
+      <section class="voice-section">
+        <div class="avatar-container">
+          <div id="avatar" class="avatar idle">
+            <div class="avatar-glow"></div>
+            <div class="avatar-inner">
+              <div class="pulse-ring"></div>
+              <!-- Simple circular avatar, can be replaced with image/Lottie -->
+              <div class="avatar-circle"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="voice-indicator">
+          <span id="voice-status">Ready</span>
+          <div id="waveform" class="waveform">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Chat UI Section -->
+      <section class="chat-section">
+        <div id="chat-container" class="chat-container">
+          <!-- Chat messages will be injected here -->
+        </div>
+      </section>
+    </main>
+
+    <!-- Hidden audio element for bot playback -->
+    <audio id="bot-audio" autoplay></audio>
+  </div>
+
+  <script type="module" src="/src/app.ts"></script>
+</body>
+
+</html>
