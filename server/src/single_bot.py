@@ -2,7 +2,8 @@
 #
 # WAPDA Voice Call Agent — Pipecat 1.0.0
 #
-
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+import wave
 import asyncio
 import os
 from typing import Optional
@@ -45,6 +46,30 @@ logger.remove()
 logger.add(lambda msg: print(msg, end=""), level="INFO")
 
 
+async def send_details_to_flutter(session_id: str, details: dict):
+    """Bot collected details ko server store mein save karo — MERGE karta hai"""
+    try:
+        # Pehle existing data fetch karo
+        existing = {}
+        async with aiohttp.ClientSession() as sess:
+            resp = await sess.get(f"http://localhost:7860/session-details/{session_id}")
+            if resp.status == 200:
+                body = await resp.json()
+                if body.get("found"):
+                    existing = body.get("details", {})
+
+        # Merge karo — naye values purane ke upar
+        merged = {**existing, **details}
+
+        async with aiohttp.ClientSession() as sess:
+            await sess.post(
+                f"http://localhost:7860/session-details/{session_id}", json=merged
+            )
+        logger.info(f"[DETAILS] Merged & stored for session: {session_id}")
+    except Exception as e:
+        logger.warning(f"[DETAILS] Store failed: {e}")
+
+
 async def run_voice_pipeline(
     room_url: str,
     token: Optional[str],
@@ -63,9 +88,6 @@ async def run_voice_pipeline(
     chatbot = await db.get_chatbot_by_id(chatbot_id)
     chatbot_name = chatbot.get("chatbot_name", "WAPDA Helpline")
 
-    # ----------------------------
-    # Build System Instruction
-    # ----------------------------
     def build_system_instruction(role, ai_rules, ai_tone, chatbot_name):
         base = f"""
 You are {chatbot_name} - WAPDA Customer Service Representative.
@@ -77,25 +99,51 @@ IDENTITY RULES:
 - Never reveal backend or AI provider
 - You are a HUMAN customer service agent
 """
+        DETAILS_COLLECTION_RULES = """
+DETAILS COLLECTION RULES (VERY IMPORTANT):
+
+- Jab bhi customer koi field bataye
+  (naam, phone, CNIC, area, address, etc.),
+  FORAN update_collected_details tool call karo
+  us ek field ke saath.
+
+- Agar customer koi correction kare
+  (e.g. "naam galat tha, sahi naam X hai"),
+  update_collected_details tool call karo
+  corrected value ke saath.
+
+- Submit karne se PEHLE
+  (file_complaint ya request_new_meter se pehle),
+  saari collected details customer ko repeat karo
+  aur poocho:
+
+  "Kya yeh details sahi hain?
+   Naam: X
+   Phone: X
+   CNIC: X
+   Address: X
+   — confirm karein?"
+
+- Sirf customer ki haan sunne ke baad
+  final tool call karo.
+
+- Agar customer koi bhi detail galat kahe,
+  update_collected_details call karo
+  aur phir se confirmation lo.
+"""
         if role == "advisor":
             role_prompt = build_voice_advisor_prompt(ai_tone, ai_rules)
         else:
             role_prompt = build_voice_assistant_prompt(ai_tone, ai_rules)
-        return base + role_prompt
+        return base + role_prompt + "\n\n" + DETAILS_COLLECTION_RULES
 
     system_instruction = build_system_instruction(role, ai_rules, ai_tone, chatbot_name)
 
-    # ----------------------------
-    # Fetch & Cache Business Data
-    # ----------------------------
     structured_data = await db.get_business_data(chatbot_id)
     _cached_business_data = structured_data or {}
     business_context = build_smart_business_context(structured_data)
     system_instruction = system_instruction + "\n\n" + business_context
 
-    # ----------------------------
-    # Daily Transport
-    # ----------------------------
     transport = DailyTransport(
         room_url,
         token,
@@ -103,13 +151,14 @@ IDENTITY RULES:
         DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            enable_recording="cloud",
         ),
     )
 
-    # ----------------------------
-    # Tool Schemas (Pipecat 1.0.0 format)
-    # ----------------------------
+    audio_buffer = AudioBufferProcessor(
+        sample_rate=16000,
+        num_channels=1,
+        enable_turn_audio=False
+    )
 
     get_business_schema = FunctionSchema(
         name="get_business_data",
@@ -117,7 +166,7 @@ IDENTITY RULES:
         properties={
             "category": {
                 "type": "string",
-                "description": "Category: contact, offices, timings, billing_info, general_info"
+                "description": "Category: contact, offices, timings, billing_info, general_info",
             }
         },
         required=["category"],
@@ -130,13 +179,30 @@ IDENTITY RULES:
             "name": {"type": "string", "description": "Customer full name"},
             "phone": {"type": "string", "description": "Customer phone number"},
             "cnic": {"type": "string", "description": "CNIC in format XXXXX-XXXXXXX-X"},
-            "reference_no": {"type": "string", "description": "Reference number from electricity bill (optional)"},
+            "reference_no": {
+                "type": "string",
+                "description": "Reference number from electricity bill (optional)",
+            },
             "area": {"type": "string", "description": "Area/location name"},
             "address": {"type": "string", "description": "Complete address"},
-            "complaint_type": {"type": "string", "description": "Type: power_outage, low_voltage, billing_issue, faulty_meter, etc"},
-            "complaint_description": {"type": "string", "description": "Detailed description of the problem"},
+            "complaint_type": {
+                "type": "string",
+                "description": "Type: power_outage, low_voltage, billing_issue, faulty_meter, etc",
+            },
+            "complaint_description": {
+                "type": "string",
+                "description": "Detailed description of the problem",
+            },
         },
-        required=["name", "phone", "cnic", "area", "address", "complaint_type", "complaint_description"],
+        required=[
+            "name",
+            "phone",
+            "cnic",
+            "area",
+            "address",
+            "complaint_type",
+            "complaint_description",
+        ],
     )
 
     check_status_schema = FunctionSchema(
@@ -144,7 +210,10 @@ IDENTITY RULES:
         description="Check status of existing complaint or meter request using CNIC and complaint/request number",
         properties={
             "cnic": {"type": "string", "description": "Customer CNIC number"},
-            "complaint_no": {"type": "string", "description": "Complaint number (CMP-XXXXXXXX-XXXXX) or Request number (MTR-XXXXXXXX-XXXXX)"},
+            "complaint_no": {
+                "type": "string",
+                "description": "Complaint number (CMP-XXXXXXXX-XXXXX) or Request number (MTR-XXXXXXXX-XXXXX)",
+            },
         },
         required=["cnic", "complaint_no"],
     )
@@ -158,10 +227,24 @@ IDENTITY RULES:
             "cnic": {"type": "string", "description": "CNIC in format XXXXX-XXXXXXX-X"},
             "area": {"type": "string", "description": "Area/location name"},
             "address": {"type": "string", "description": "Complete address"},
-            "meter_type": {"type": "string", "description": "single_phase, three_phase, or commercial"},
-            "premises_type": {"type": "string", "description": "residential, commercial, or industrial"},
+            "meter_type": {
+                "type": "string",
+                "description": "single_phase, three_phase, or commercial",
+            },
+            "premises_type": {
+                "type": "string",
+                "description": "residential, commercial, or industrial",
+            },
         },
-        required=["name", "phone", "cnic", "area", "address", "meter_type", "premises_type"],
+        required=[
+            "name",
+            "phone",
+            "cnic",
+            "area",
+            "address",
+            "meter_type",
+            "premises_type",
+        ],
     )
 
     get_customer_schema = FunctionSchema(
@@ -178,11 +261,56 @@ IDENTITY RULES:
         description="Escalate call to human agent. Use for angry customers, complex issues, supervisor requests.",
         properties={
             "reason": {"type": "string", "description": "Reason for escalation"},
-            "customer_name": {"type": "string", "description": "Customer name if known"},
-            "customer_phone": {"type": "string", "description": "Customer phone if known"},
-            "customer_cnic": {"type": "string", "description": "Customer CNIC if known"},
+            "customer_name": {
+                "type": "string",
+                "description": "Customer name if known",
+            },
+            "customer_phone": {
+                "type": "string",
+                "description": "Customer phone if known",
+            },
+            "customer_cnic": {
+                "type": "string",
+                "description": "Customer CNIC if known",
+            },
         },
         required=["reason"],
+    )
+
+    update_details_schema = FunctionSchema(
+        name="update_collected_details",
+        description=(
+            "Call this EVERY TIME a new piece of customer info is collected or corrected during conversation. "
+            "For example: jab customer naam bataye, phone bataye, CNIC bataye, ya koi correction kare. "
+            "Do NOT wait for final submission — update field by field as customer speaks."
+        ),
+        properties={
+            "name": {
+                "type": "string",
+                "description": "Customer full name (if collected)",
+            },
+            "phone": {"type": "string", "description": "Phone number (if collected)"},
+            "cnic": {"type": "string", "description": "CNIC (if collected)"},
+            "area": {"type": "string", "description": "Area (if collected)"},
+            "address": {"type": "string", "description": "Address (if collected)"},
+            "complaint_type": {
+                "type": "string",
+                "description": "Complaint type (if collected)",
+            },
+            "reference_no": {
+                "type": "string",
+                "description": "Reference number (if collected)",
+            },
+            "meter_type": {
+                "type": "string",
+                "description": "Meter type (if collected)",
+            },
+            "premises_type": {
+                "type": "string",
+                "description": "Premises type (if collected)",
+            },
+        },
+        required=[],
     )
 
     end_call_schema = FunctionSchema(
@@ -194,9 +322,6 @@ IDENTITY RULES:
         required=[],
     )
 
-    # ----------------------------
-    # Gemini Live LLM (Pipecat 1.0.0)
-    # ----------------------------
     tools = ToolsSchema(
         standard_tools=[
             get_business_schema,
@@ -206,6 +331,7 @@ IDENTITY RULES:
             get_customer_schema,
             escalate_schema,
             end_call_schema,
+            update_details_schema,  # ✅ add karo
         ]
     )
 
@@ -231,8 +357,7 @@ IDENTITY RULES:
 
         if not data:
             await params.result_callback(
-                "Iss category ki information abhi available nahi hai.",
-                run_llm=True
+                "Iss category ki information abhi available nahi hai."
             )
             return
 
@@ -249,8 +374,9 @@ IDENTITY RULES:
         else:
             result = str(data)
 
-        await params.result_callback(result, run_llm=True)
+        await params.result_callback(result)
 
+    # ✅ FIXED INDENTATION
     async def file_complaint_wrapper(params: FunctionCallParams):
         logger.info(f"[TOOL] file_complaint called | args: {params.arguments}")
         try:
@@ -267,15 +393,27 @@ IDENTITY RULES:
                 complaint_description=params.arguments.get("complaint_description"),
             )
             logger.info(f"[TOOL] Complaint filed: {result}")
+
+            # ✅ Flutter ko details bhejo
+            if result.get("success"):
+                asyncio.create_task(
+                    send_details_to_flutter(
+                        session_id,
+                        {
+                            **params.arguments,
+                            "complaint_no": result.get("complaint_no"),
+                            "record_type": "complaint",
+                        },
+                    )
+                )
+
             await params.result_callback(
-                result.get("message", "Complaint filed successfully."),
-                run_llm=True
+                result.get("message", "Complaint filed successfully.")
             )
         except Exception as e:
             logger.error(f"[TOOL] Complaint error: {e}")
             await params.result_callback(
                 "Shikayat darj karne mein masla aaya. Please dobara koshish karein.",
-                run_llm=True
             )
 
     async def check_complaint_status_wrapper(params: FunctionCallParams):
@@ -286,16 +424,15 @@ IDENTITY RULES:
                 complaint_no=params.arguments.get("complaint_no"),
             )
             await params.result_callback(
-                result.get("message", "Status check complete."),
-                run_llm=True
+                result.get("message", "Status check complete.")
             )
         except Exception as e:
             logger.error(f"[TOOL] Status check error: {e}")
             await params.result_callback(
                 "Status check mein masla aaya. Please dobara koshish karein.",
-                run_llm=True
             )
 
+    # ✅ FIXED INDENTATION
     async def request_new_meter_wrapper(params: FunctionCallParams):
         logger.info(f"[TOOL] request_new_meter called | args: {params.arguments}")
         try:
@@ -311,15 +448,27 @@ IDENTITY RULES:
                 premises_type=params.arguments.get("premises_type"),
             )
             logger.info(f"[TOOL] Meter request: {result}")
+
+            # ✅ Flutter ko details bhejo
+            if result.get("success"):
+                asyncio.create_task(
+                    send_details_to_flutter(
+                        session_id,
+                        {
+                            **params.arguments,
+                            "request_no": result.get("request_no"),
+                            "record_type": "meter_request",
+                        },
+                    )
+                )
+
             await params.result_callback(
                 result.get("message", "Meter request submitted successfully."),
-                run_llm=True
             )
         except Exception as e:
             logger.error(f"[TOOL] Meter request error: {e}")
             await params.result_callback(
                 "Meter request submit karne mein masla aaya. Please dobara koshish karein.",
-                run_llm=True
             )
 
     async def get_customer_info_wrapper(params: FunctionCallParams):
@@ -328,8 +477,7 @@ IDENTITY RULES:
             result = await get_customer_info_tool(cnic=params.arguments.get("cnic"))
             if not result.get("success"):
                 await params.result_callback(
-                    result.get("message", "Koi record nahi mila."),
-                    run_llm=True
+                    result.get("message", "Koi record nahi mila.")
                 )
                 return
 
@@ -338,27 +486,33 @@ IDENTITY RULES:
 
             response_parts = []
             if complaints:
-                response_parts.append(f"Total {len(complaints)} shikayatein milti hain:")
+                response_parts.append(
+                    f"Total {len(complaints)} shikayatein milti hain:"
+                )
                 for c in complaints[:5]:
                     response_parts.append(
                         f"- {c.get('complaint_no')}: {c.get('complaint_type')} - Status: {c.get('status')}"
                     )
             if meter_requests:
-                response_parts.append(f"Total {len(meter_requests)} meter requests milti hain:")
+                response_parts.append(
+                    f"Total {len(meter_requests)} meter requests milti hain:"
+                )
                 for r in meter_requests[:5]:
                     response_parts.append(
                         f"- {r.get('request_no')}: {r.get('meter_type')} - Status: {r.get('status')}"
                     )
 
             await params.result_callback(
-                "\n".join(response_parts) if response_parts else "Koi record nahi mila.",
-                run_llm=True
+                (
+                    "\n".join(response_parts)
+                    if response_parts
+                    else "Koi record nahi mila."
+                ),
             )
         except Exception as e:
             logger.error(f"[TOOL] Customer info error: {e}")
             await params.result_callback(
-                "Record dhoondhne mein masla aaya.",
-                run_llm=True
+                "Record dhoondhne mein masla aaya."
             )
 
     async def escalate_to_human_wrapper(params: FunctionCallParams):
@@ -373,23 +527,50 @@ IDENTITY RULES:
             )
             logger.info(f"[TOOL] Escalation: {result}")
             await params.result_callback(
-                result.get("message", "Call escalated to human agent."),
-                run_llm=True
+                result.get("message", "Call escalated to human agent.")
             )
         except Exception as e:
             logger.error(f"[TOOL] Escalation error: {e}")
             await params.result_callback(
                 "Escalation mein masla aaya. Please rukain, human agent jald aa raha hai.",
-                run_llm=True
+                
             )
+
+    async def update_collected_details_wrapper(params: FunctionCallParams):
+        logger.info(f"[TOOL] update_collected_details | args: {params.arguments}")
+        filtered = {k: v for k, v in params.arguments.items() if v}
+        if filtered:
+            asyncio.create_task(send_details_to_flutter(session_id, filtered))
+        await params.result_callback("Details updated.", )
 
     async def end_call_wrapper(params: FunctionCallParams):
         logger.info(f"[TOOL] end_call triggered — initiating graceful shutdown")
 
-        await params.result_callback("Call ended.", run_llm=False)
+        await params.result_callback("Call ended.", )
 
         async def _graceful_shutdown():
             await asyncio.sleep(1.5)
+            try:
+                logger.info("[DEBUG] Stopping recording")
+                await audio_buffer.stop_recording()
+                merged = audio_buffer.merge_audio_buffers()
+                logger.info(f"[RECORDING] Merged size: {len(merged) if merged else 0}")
+                if merged and len(merged) > 0:
+                    wav_path = f"/tmp/{session_id}.wav"
+                    with wave.open(wav_path, 'wb') as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(16000)
+                        wav_file.writeframes(merged)
+                    logger.info(f"[RECORDING] WAV saved: {wav_path}")
+                    asyncio.create_task(
+                        fetch_recording_and_store(session_id=session_id, wav_path=wav_path)
+                    )
+                else:
+                    logger.warning("[RECORDING] No audio captured")
+            except Exception as e:
+                logger.error(f"[RECORDING] Save failed: {e}")
+
             try:
                 room_name = room_url.split("/")[-1]
                 async with aiohttp.ClientSession() as sess:
@@ -399,7 +580,10 @@ IDENTITY RULES:
                             "Authorization": f"Bearer {os.getenv('DAILY_API_KEY')}",
                             "Content-Type": "application/json",
                         },
-                        json={"data": {"type": "call-ended", "action": "end_call"}, "recipients": "*"},
+                        json={
+                            "data": {"type": "call-ended", "action": "end_call"},
+                            "recipients": "*",
+                        },
                     )
                 logger.info("[VOICE] Sent call-ended to frontend via REST")
                 await asyncio.sleep(0.5)
@@ -428,10 +612,8 @@ IDENTITY RULES:
     llm.register_function("get_customer_info", get_customer_info_wrapper)
     llm.register_function("escalate_to_human", escalate_to_human_wrapper)
     llm.register_function("end_call", end_call_wrapper)
+    llm.register_function("update_collected_details", update_collected_details_wrapper)
 
-    # ----------------------------
-    # Context
-    # ----------------------------
     context = LLMContext()
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -441,9 +623,6 @@ IDENTITY RULES:
         ),
     )
 
-    # ----------------------------
-    # Pipeline
-    # ----------------------------
     pipeline = Pipeline(
         [
             transport.input(),
@@ -451,6 +630,7 @@ IDENTITY RULES:
             llm,
             assistant_aggregator,
             transport.output(),
+            audio_buffer, 
         ]
     )
 
@@ -462,76 +642,42 @@ IDENTITY RULES:
         ),
     )
 
-    # ----------------------------
-    # Auto Start
-    # ----------------------------
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
         logger.info(f"[VOICE] First participant joined — starting conversation")
+        await audio_buffer.start_recording()
+        logger.info("[DEBUG] Audio recording initialized")
         await asyncio.sleep(1.0)
         await task.queue_frames([LLMRunFrame()])
 
-    # ----------------------------
-    # Recording Start
-    # ----------------------------
-    @transport.event_handler("on_participant_joined")
-    async def start_recording_after_join(transport, participant):
-        logger.info("Participant joined — starting cloud recording")
-        room_name = room_url.split("/")[-1]
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"[VOICE] Client disconnected - session {session_id}")
 
-        async def _start_rec():
             try:
-                async with aiohttp.ClientSession() as session:
-                    await session.post(
-                        f"https://api.daily.co/v1/rooms/{room_name}/recordings/start",
-                        headers={
-                            "Authorization": f"Bearer {os.getenv('DAILY_API_KEY')}",
-                            "Content-Type": "application/json",
-                        },
-                        json={"type": "cloud"}
-                    )
-            except Exception as e:
-                logger.error(f"Recording start failed: {e}")
-
-        asyncio.create_task(_start_rec())
-
-    # ----------------------------
-    # Disconnect Cleanup
-    # ----------------------------
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"[VOICE] Client disconnected - session {session_id}")
-
-        try:
-            await db.create_voice_session(
-                chatbot_id=chatbot_id,
-                chat_id=chat_id,
-                session_id=session_id,
-                room_url=room_url,
-                transcript=transcript_log or None,
-            )
-            asyncio.create_task(
-                fetch_recording_and_store(
+                await db.create_voice_session(
+                    chatbot_id=chatbot_id,
+                    chat_id=chat_id,
                     session_id=session_id,
-                    room_url=room_url
+                    room_url=room_url,
+                    transcript=transcript_log or None,
                 )
-            )
-        except Exception as e:
-            logger.error(f"Voice session save failed: {e}")
+                
+            except Exception as e:
+                logger.error(f"Voice session save failed: {e}")
 
-        try:
-            await task.cancel()
-        except:
-            pass
-        try:
-            await llm.shutdown()
-        except:
-            pass
-        try:
-            await transport.leave()
-        except:
-            pass
-
+            try:
+                await task.cancel()
+            except:
+                pass
+            try:
+                await llm.shutdown()
+            except:
+                pass
+            try:
+                await transport.leave()
+            except:
+                pass
     runner = PipelineRunner(handle_sigint=False)
 
     try:

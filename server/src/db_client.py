@@ -237,3 +237,36 @@ class DBClient:
         except Exception as e:
             logger.error(f"[DB] create_chat_session error: {e}")
             return None
+    async def create_voice_session(self, chatbot_id: str, chat_id: str, session_id: str, room_url: str, transcript=None):
+        try:
+            result = await self._run(
+                self.client.table("voice_sessions").insert({
+                    "chatbot_id": chatbot_id,
+                    "chat_id": chat_id,
+                    "session_id": session_id,
+                    "room_url": room_url,
+                    "transcript": transcript,
+                }).execute
+            )
+            if result.data and len(result.data) > 0:
+                logger.info(f"[DB] Voice session created | ID: {result.data[0]['id']}")
+                return result.data[0]["id"]
+            return None
+        except Exception as e:
+            logger.error(f"[DB] create_voice_session error: {e}")
+            return None
+
+    async def update_voice_recording(self, session_id: str, recording_path: str, duration: int = 0, participants: int = 0):
+        try:
+            result = await self._run(
+                self.client.table("voice_sessions").update({
+                    "recording_path": recording_path,
+                    "duration": duration,
+                    "participants": participants,
+                }).eq("session_id", session_id).execute
+            )
+            logger.info(f"[DB] Recording updated for session: {session_id}")
+            return True
+        except Exception as e:
+            logger.error(f"[DB] update_voice_recording error: {e}")
+            return False
